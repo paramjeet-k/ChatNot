@@ -1,96 +1,153 @@
 # app.py
 import math
 import re
-from typing import List, Dict, Tuple
+from typing import Dict, List, Tuple
 import streamlit as st
 
 # ---------------------------
-# Utilities
+# Utility helpers
 # ---------------------------
+def parse_kv_numbers(text: str, keys: List[str]) -> Dict[str, float]:
+    """
+    Parses k=v pairs (numbers) from free text, case-insensitive.
+    Example: 'h=10 b=3 s=3 j=0.5 t=2 d=165 rho=1000'
+    """
+    out = {}
+    for k in keys:
+        m = re.search(rf"\b{k}\s*=\s*([-+]?\d*\.?\d+)", text, flags=re.I)
+        if m:
+            out[k] = float(m.group(1))
+    return out
 
 def mm_to_m(x_mm: float) -> float:
     return x_mm / 1000.0
 
-def inches_to_m(x_in: float) -> float:
-    return x_in * 0.0254
-
 def ft_to_m(x_ft: float) -> float:
     return x_ft * 0.3048
 
-def kg_per_m3_to_g_per_cc(x: float) -> float:
-    return x / 1000.0
+def lb_to_kg(x_lb: float) -> float:
+    return x_lb * 0.45359237
 
-def area_of_hole(diam_m: float) -> float:
+def circle_area(diam_m: float) -> float:
     r = diam_m / 2.0
     return math.pi * r * r
 
-def parse_float(s, default=None):
-    try:
-        return float(s)
-    except:
-        return default
+# ---------------------------
+# Calculation engines
+# ---------------------------
+def calc_powder_factor(H, B, S, J, T, D_mm, rho):
+    """Returns (pf_kg_per_m3, charge_per_hole_kg, charged_length_m, rock_volume_m3)"""
+    d_m = mm_to_m(D_mm)
+    area = circle_area(d_m)
+    charged_len = max(H + J - T, 0.0)
+    charge_per_hole = rho * area * charged_len
+    rock_volume = B * S * H
+    pf = charge_per_hole / rock_volume if rock_volume > 0 else 0.0
+    return pf, charge_per_hole, charged_len, rock_volume
+
+def calc_scaled_distance(distance, distance_units, charge_kg):
+    """Scaled Distance (metric): SD = distance(m) / sqrt(charge_kg_per_delay)"""
+    if distance_units.lower() in ["ft", "feet"]:
+        distance_m = ft_to_m(distance)
+    else:
+        distance_m = distance
+    if charge_kg <= 0:
+        return None
+    return distance_m / math.sqrt(charge_kg)
+
+def lk_burden_spacing(D_mm, k, alpha, F):
+    """
+    A configurable Langefors–Kihlström-style rule of thumb.
+    We keep it parametric to avoid hard-coding site-specific constants.
+
+    B = k * (D_mm/1000) * sqrt(F)
+    S = alpha * B
+
+    Where:
+    - k: burden coefficient (typ. 22–35 for bench work depending on rock/energy)
+    - alpha: spacing-to-burden ratio (typ. 1.1–1.4)
+    - F: strength/energy factor (dimensionless). Keep ~1.0 unless you calibrate.
+    """
+    B = k * mm_to_m(D_mm) * math.sqrt(max(F, 0))
+    S = alpha * B
+    return B, S
+
+def nobel_cartridge_method(charged_len_m, cart_len_m, cart_diam_mm, rho_cart):
+    """
+    Simple 'Nobel cartridge' style estimate:
+    - Approximate number of cartridges = charged_len / cart_len (rounded up)
+    - Each cartridge mass = rho_cart * (pi*(d/2)^2)*cart_len
+    Returns: (num_carts, mass_per_cart_kg, total_mass_kg)
+    """
+    d_m = mm_to_m(cart_diam_mm)
+    vol_per_cart = circle_area(d_m) * cart_len_m
+    mass_per_cart = rho_cart * vol_per_cart
+    num_carts = max(int(math.ceil(charged_len_m / cart_len_m)), 0)
+    total_mass = num_carts * mass_per_cart
+    return num_carts, mass_per_cart, total_mass
 
 # ---------------------------
-# Minimal knowledge base (curated facts)
+# Knowledge base (expandable)
 # ---------------------------
 KB = [
     {
-        "q": "What is powder factor?",
-        "a": "Powder Factor (PF) is the mass of explosive used divided by the rock volume broken. Units often kg/m³ (metric) or lb/yd³ (imperial). Typical surface bench blasting values range ~0.3–1.0 kg/m³ depending on rock strength, fragmentation target, and energy of the explosive."
+        "q": "Powder factor",
+        "a": "Powder Factor (PF) = charge mass / rock volume (kg/m³ metric). For a bench hole: charge ≈ ρ × (π(D/2)²) × charged_length, and volume ≈ B × S × H."
     },
     {
-        "q": "How do I estimate burden and spacing?",
-        "a": "A common starting point for bench blasting (ANFO/ANFO blends) is: Burden B ≈ (25–35) × hole diameter (in mm) / 1000 (m), or B ≈ 25–40×D (in) in inches. Spacing S ≈ 1.15–1.4 × B. Adjust for rock mass quality, stiffness, and energy."
+        "q": "Langefors–Kihlström method",
+        "a": "Langefors–Kihlström provides empirical relationships linking burden/spacing to hole diameter, explosive/rock factors, and desired results. A practical parametric form: B = k·(D/1000)·√F and S = α·B, with k (≈22–35), α (≈1.1–1.4), and F as a site-tuned factor."
     },
     {
-        "q": "What is stemming and how much should I use?",
-        "a": "Stemming is inert material at the top of the hole to confine gases. A quick rule: stemming length T ≈ 0.7–1.0 × burden (bench blasting), or T ≈ 20–30 × hole diameter (in mm), whichever suits fragmentation and flyrock control."
+        "q": "Nobel cartridge method",
+        "a": "A cartridge-based charging approach: estimate number of cartridges from charged length and cartridge length, then compute mass using cartridge diameter and density. Useful where packaged explosives are used."
     },
     {
-        "q": "How do I compute charge per hole?",
-        "a": "Charge per hole (kg) = explosive density (kg/m³) × hole cross-section area (m²) × charged length (m). Charged length is typically (bench height + subdrill – stemming)."
+        "q": "Burden and spacing",
+        "a": "Common starting point for surface benches: B ≈ 25–35 × D(mm)/1000 (in meters), S ≈ 1.15–1.4 × B. Tune for geology, stiffness, face conditions, and explosive energy."
     },
     {
-        "q": "What is scaled distance and why is it used?",
-        "a": "Scaled Distance (SD) = distance (m) / sqrt(charge per delay, kg). It correlates with ground vibration. Lower SD implies higher vibration. Site-specific constants are required for accurate PPV prediction."
+        "q": "Stemming",
+        "a": "Stemming confines gases. Quick rules: T ≈ 0.7–1.0 × B or ≈20–30 × D(mm). Increase to reduce flyrock/airblast; ensure collar quality."
     },
     {
-        "q": "How do initiation and delays affect results?",
-        "a": "Using short-delay intervals between holes/rows reduces instantaneous charge per delay, improves muckpile throw and fragmentation, and helps control vibration. Keep actual per-delay charge consistent with design assumptions."
+        "q": "Charge per hole",
+        "a": "Charge per hole (kg) = ρ (kg/m³) × π(D/2)² (m²) × charged length (m). Charged length ≈ H + J − T."
     },
     {
-        "q": "How to reduce flyrock?",
-        "a": "Avoid overcharging, increase stemming or burden (within limits), improve hole collar quality, check for decking voids, and ensure accurate drilling to design angles and positions."
+        "q": "Scaled distance and vibration",
+        "a": "Scaled Distance (metric) = distance (m) / √(charge per delay in kg). Lower SD → higher vibration (PPV). Always calibrate with site data."
     },
     {
-        "q": "What to do in case of a misfire?",
-        "a": "Follow site SOPs: secure the area, notify supervisor/blaster-in-charge, mark and record the hole, forbid drilling or digging near the misfire, and only re-initiate or make safe under approved procedures with proper clearance."
+        "q": "Flyrock reduction",
+        "a": "Avoid overcharge, increase stemming/burden within limits, ensure accurate drilling (collar/angle/position), avoid voids, and keep per-delay charge consistent."
     },
     {
-        "q": "How do water conditions affect explosive choice?",
-        "a": "In dry holes, ANFO is economical. In wet or dynamic water, use water-resistant emulsions or heavy ANFO blends. Consider gas generation, density, and energy with supplier tech sheets."
+        "q": "Water in holes",
+        "a": "Use water-resistant emulsions or heavy-ANFO in wet/dynamic-water holes. Consider density, energy, gas generation, and manufacturer guidance."
     },
     {
-        "q": "What inputs do I need to design a bench blast?",
-        "a": "Rock properties (UCS/RQD/JSA), bench height, hole diameter, explosive density & energy, desired fragmentation, face conditions, equipment dig/haul constraints, environmental limits (vibration, airblast), and safety/legal standards."
+        "q": "Safety and misfires",
+        "a": "Follow SOPs and regulatory code: secure area, mark misfire, do not drill/dig, notify blaster-in-charge, and neutralize under approved procedures only."
     },
 ]
 
-# Simple bag-of-words retrieval (tiny BM25-like)
 def tokenize(text: str) -> List[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
+# Light BM25-like retrieval (no heavy deps)
 VOCAB = {}
 DOCS = []
 for item in KB:
-    text = (item["q"] + " " + item["a"]).lower()
-    tokens = tokenize(text)
+    tokens = tokenize(item["q"] + " " + item["a"])
     DOCS.append(tokens)
     for t in set(tokens):
         VOCAB[t] = VOCAB.get(t, 0) + 1
 
-def bm25_like(query: str, k1=1.5, b=0.75) -> List[Tuple[int, float]]:
+def bm25_like(query: str, k1=1.5, b=0.75) -> Tuple[int, float]:
     N = len(DOCS)
+    if N == 0:
+        return 0, 0.0
     avgdl = sum(len(d) for d in DOCS) / N
     q_terms = tokenize(query)
     scores = [0.0] * N
@@ -103,169 +160,183 @@ def bm25_like(query: str, k1=1.5, b=0.75) -> List[Tuple[int, float]]:
             f = doc.count(qi)
             dl = len(doc)
             denom = f + k1 * (1 - b + b * (dl / avgdl))
-            score = idf * (f * (k1 + 1)) / (denom if denom != 0 else 1)
-            scores[idx] += score
-    return sorted(list(enumerate(scores)), key=lambda x: x[1], reverse=True)
+            scores[idx] += idf * (f * (k1 + 1)) / (denom if denom else 1.0)
+    top_idx = max(range(N), key=lambda i: scores[i])
+    return top_idx, scores[top_idx]
 
-# ---------------------------
-# Chatbot brain (router)
-# ---------------------------
-
-def handle_calculations(message: str, defaults: Dict) -> Tuple[bool, str]:
-    msg = message.lower()
-
-    # Extract common numbers if the user writes like "H=10m, D=165mm, rho=1000"
-    nums = dict(re.findall(r"(b|s|h|j|t|d|rho|pf)\s*=\s*([0-9]*\.?[0-9]+)", msg))
-
-    # Calculator: Powder Factor (also reports charge per hole)
-    if "powder factor" in msg or re.search(r"\bpf\b", msg):
-        H = parse_float(nums.get("h"), defaults["H"])
-        B = parse_float(nums.get("b"), defaults["B"])
-        S = parse_float(nums.get("s"), defaults["S"])
-        J = parse_float(nums.get("j"), defaults["J"])
-        T = parse_float(nums.get("t"), defaults["T"])
-        D = parse_float(nums.get("d"), defaults["D"])
-        rho = parse_float(nums.get("rho"), defaults["rho"])
-
-        diam_m = D / 1000.0  # mm -> m
-        area = area_of_hole(diam_m)
-        charged_len = max(H + J - T, 0.0)
-        charge_per_hole = rho * area * charged_len  # kg
-        rock_volume = B * S * H  # m3
-        pf = (charge_per_hole / rock_volume) if rock_volume > 0 else 0.0
-
-        return True, (
-            f"🔢 **Powder Factor Calculator**\n\n"
-            f"- Hole diameter D: **{D:.1f} mm**  \n"
-            f"- Bench height H: **{H:.2f} m**, Subdrill J: **{J:.2f} m**, Stemming T: **{T:.2f} m**  \n"
-            f"- Burden B: **{B:.2f} m**, Spacing S: **{S:.2f} m**  \n"
-            f"- Explosive density ρ: **{rho:.0f} kg/m³**  \n\n"
-            f"**Charged length** = H + J − T = **{charged_len:.2f} m**  \n"
-            f"**Charge per hole** = ρ × area × charged_len = **{charge_per_hole:.1f} kg**  \n"
-            f"**Rock volume per hole** = B × S × H = **{rock_volume:.2f} m³**  \n"
-            f"**Powder Factor (PF)** = charge/volume = **{pf:.3f} kg/m³**"
-        )
-
-    # Calculator: Scaled Distance (vibration proxy)
-    if "scaled distance" in msg or re.search(r"\bsd\b", msg) or "vibration" in msg:
-        m_dist = re.search(r"(\d+\.?\d*)\s*(m|meter|metre|ft)\b", msg)
-        m_charge = re.search(r"(\d+\.?\d*)\s*(kg|lb)\b", msg)
-        if m_dist and m_charge:
-            dist_val = float(m_dist.group(1))
-            if m_dist.group(2) == "ft":
-                dist_m = ft_to_m(dist_val)
-            else:
-                dist_m = dist_val
-            q = float(m_charge.group(1))
-            if m_charge.group(2) == "lb":
-                q *= 0.453592
-            if q <= 0:
-                return True, "Please provide a positive charge mass per delay."
-            sd = dist_m / math.sqrt(q)
-            return True, f"📉 **Scaled Distance (metric)** = distance / √charge_per_delay = **{sd:.2f} m/√kg**"
-        else:
-            return True, "To compute Scaled Distance, include a distance (m or ft) and a charge per delay (kg or lb) in your message."
-
-    # Quick rules for B, S, T
-    if "burden" in msg and "spacing" in msg and any(k in msg for k in ["estimate", "rule", "start"]):
-        D = parse_float(nums.get("d"), defaults["D"])
-        B = 30 * (D / 1000.0)  # ≈ 30 × D(mm) → m
-        S = 1.25 * B
-        T = 25 * (D / 1000.0)  # ≈ 25 × D(mm) → m
-        return True, (
-            f"📐 **Starter rules (bench blasting)**  \n"
-            f"- Burden B ≈ **{B:.2f} m**  \n"
-            f"- Spacing S ≈ **{S:.2f} m**  \n"
-            f"- Stemming T ≈ **{T:.2f} m**  \n"
-            f"(Assumed D={D:.0f} mm; tweak for your rock/energy constraints.)"
-        )
-
-    return False, ""
-
-def retrieve_answer(message: str) -> str:
-    ranks = bm25_like(message)
-    top_idx, _ = ranks[0]
-    item = KB[top_idx]
-    suggestion = ""
-    if any(k in message.lower() for k in ["calculate", "how much", "compute", "powder factor", " pf", "pf "]):
-        suggestion = "\n\nTry: 'PF h=10 b=3 s=3 j=0.5 t=2 d=165 rho=1000'"
-    return f"**{item['q']}**\n{item['a']}{suggestion}"
+def kb_answer(query: str) -> str:
+    idx, _ = bm25_like(query)
+    item = KB[idx]
+    return f"**{item['q']}**\n{item['a']}"
 
 # ---------------------------
 # Streamlit UI
 # ---------------------------
-
-st.set_page_config(page_title="Mining Drilling & Blasting Chatbot", page_icon="💥", layout="wide")
-
-st.title("💥 Drilling & Blasting Chatbot (Streamlit)")
-st.caption("For educational and planning support only — follow site SOPs, regulations, and a licensed blaster's direction.")
+st.set_page_config(page_title="Drilling & Blasting Chatbot", page_icon="💥", layout="wide")
+st.title("💥 Drilling & Blasting Chatbot")
+st.caption("Educational planner. Always follow site SOPs, regulations, and a licensed blaster's direction.")
 
 with st.sidebar:
-    st.header("Settings")
-    units = st.selectbox("Units", ["Metric"], index=0, help="This prototype uses metric internally.")
-    st.markdown("---")
-    st.subheader("Default Design Inputs")
-
-    # Defaults (stored in session)
+    st.header("Global defaults")
     if "defaults" not in st.session_state:
         st.session_state.defaults = {
-            "H": 10.0,    # bench height (m)
-            "J": 0.5,     # subdrill (m)
-            "T": 2.0,     # stemming (m)
-            "B": 3.0,     # burden (m)
-            "S": 3.5,     # spacing (m)
-            "D": 165.0,   # diameter (mm)
-            "rho": 1000.0 # explosive density (kg/m3)
+            "H": 10.0,     # bench height (m)
+            "J": 0.5,      # subdrill (m)
+            "T": 2.0,      # stemming (m)
+            "B": 3.0,      # burden (m) default
+            "S": 3.5,      # spacing (m) default
+            "D": 165.0,    # hole diameter (mm)
+            "rho": 1000.0, # explosive density (kg/m³)
+            # L-K method defaults (all adjustable)
+            "lk_k": 30.0,      # burden coefficient
+            "lk_alpha": 1.25,  # spacing/burden ratio
+            "lk_F": 1.00,      # energy/rock factor
+            # Nobel cartridge defaults
+            "cart_len": 0.40,  # m
+            "cart_diam": 83.0, # mm
+            "cart_rho": 1100.0 # kg/m³
         }
-
     d = st.session_state.defaults
     d["H"]   = st.number_input("Bench height H (m)", 1.0, 100.0, d["H"], 0.1)
     d["J"]   = st.number_input("Subdrill J (m)", 0.0, 5.0, d["J"], 0.1)
     d["T"]   = st.number_input("Stemming T (m)", 0.0, 10.0, d["T"], 0.1)
-    d["B"]   = st.number_input("Burden B (m)", 0.5, 10.0, d["B"], 0.1)
-    d["S"]   = st.number_input("Spacing S (m)", 0.5, 12.0, d["S"], 0.1)
-    d["D"]   = st.number_input("Hole diameter D (mm)", 50.0, 311.0, d["D"], 1.0)
+    d["B"]   = st.number_input("Burden B (m) [default]", 0.5, 12.0, d["B"], 0.1)
+    d["S"]   = st.number_input("Spacing S (m) [default]", 0.5, 15.0, d["S"], 0.1)
+    d["D"]   = st.number_input("Hole diameter D (mm)", 50.0, 310.0, d["D"], 1.0)
     d["rho"] = st.number_input("Explosive density ρ (kg/m³)", 700.0, 1400.0, d["rho"], 10.0)
 
-    st.info("Tip: Ask me to 'estimate burden & spacing rules' or 'calculate powder factor'.", icon="💡")
+    st.markdown("---")
+    st.subheader("Langefors–Kihlström (tunable)")
+    d["lk_k"]     = st.number_input("k (burden coefficient)", 10.0, 60.0, d["lk_k"], 0.5)
+    d["lk_alpha"] = st.number_input("α (spacing/burden)", 1.0, 2.0, d["lk_alpha"], 0.05)
+    d["lk_F"]     = st.number_input("F (factor √F used)", 0.1, 3.0, d["lk_F"], 0.05)
+
+    st.markdown("---")
+    st.subheader("Nobel cartridge (tunable)")
+    d["cart_len"]  = st.number_input("Cartridge length L (m)", 0.05, 1.00, d["cart_len"], 0.01)
+    d["cart_diam"] = st.number_input("Cartridge diameter (mm)", 20.0, 150.0, d["cart_diam"], 1.0)
+    d["cart_rho"]  = st.number_input("Cartridge density (kg/m³)", 800.0, 1600.0, d["cart_rho"], 10.0)
 
 st.markdown("""
 **What I can do**
-- Answer drilling & blasting questions (burden/spacing, stemming, misfires, water, initiation).
-- Do quick calcs: Powder Factor (PF), charge per hole, scaled distance (basic).
-- Give starter rules for bench blast design.
+- Answer D&B questions (burden/spacing, stemming, water, misfires, vibration).
+- Calculators: **Powder Factor**, **charge per hole**, **Scaled Distance**, **L-K burden/spacing**, **Nobel cartridge** estimate.
+- All coefficients are adjustable in the sidebar (so this fits your site’s calibration).
 """)
 
-# Chat history
+# Session chat state
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "Hi! Ask me anything about drilling & blasting. For PF, try: 'PF h=10 b=3 s=3 j=0.5 t=2 d=165 rho=1000'."}
+        {
+            "role": "assistant",
+            "content": "Hi! Ask me anything about drilling & blasting. Examples:\n"
+                       "- `pf h=10 b=3 s=3 j=0.5 t=2 d=165 rho=1000`\n"
+                       "- `lk d=165 k=30 alpha=1.25 f=1.0`\n"
+                       "- `nobel d=165 L=0.40 cart_d=83 rho=1100 h=10 j=0.5 t=2`\n"
+                       "- `sd 300 m, 35 kg`"
+        }
     ]
 
-# Render history
+# Render transcript
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# Input
-prompt = st.chat_input("Type your drilling & blasting question…")
+def respond(user_text: str) -> str:
+    txt = user_text.strip()
 
-def reply(user_text: str):
-    handled, answer = handle_calculations(user_text, st.session_state.defaults)
-    if handled:
-        return answer
-    return retrieve_answer(user_text)
+    # ---- Powder Factor ------------------------------------------------------
+    if re.search(r"\bpf\b|\bpowder\s*factor\b", txt, flags=re.I):
+        vals = parse_kv_numbers(txt, ["h","b","s","j","t","d","rho"])
+        H   = vals.get("h", st.session_state.defaults["H"])
+        B   = vals.get("b", st.session_state.defaults["B"])
+        S   = vals.get("s", st.session_state.defaults["S"])
+        J   = vals.get("j", st.session_state.defaults["J"])
+        T   = vals.get("t", st.session_state.defaults["T"])
+        Dmm = vals.get("d", st.session_state.defaults["D"])
+        rho = vals.get("rho", st.session_state.defaults["rho"])
+        pf, qhole, Lc, V = calc_powder_factor(H,B,S,J,T,Dmm,rho)
+        return (f"🔢 **Powder Factor**\n"
+                f"- Inputs: H={H:.2f} m, B={B:.2f} m, S={S:.2f} m, J={J:.2f} m, T={T:.2f} m, D={Dmm:.0f} mm, ρ={rho:.0f} kg/m³\n"
+                f"- Charged length Lc = H+J−T = **{Lc:.2f} m**\n"
+                f"- Charge per hole = **{qhole:.1f} kg**\n"
+                f"- Rock volume per hole = **{V:.2f} m³**\n"
+                f"- **PF = {pf:.3f} kg/m³**")
 
-if prompt:
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    # ---- Scaled Distance -----------------------------------------------------
+    if re.search(r"\bsd\b|scaled\s*distance|vibration", txt, flags=re.I):
+        # accept patterns like "sd 300 m, 35 kg"
+        md = re.search(r"(\d+(\.\d+)?)\s*(m|meter|metre|ft)", txt, flags=re.I)
+        mq = re.search(r"(\d+(\.\d+)?)\s*(kg|lb)", txt, flags=re.I)
+        if md and mq:
+            dist = float(md.group(1)); du = md.group(3)
+            q = float(mq.group(1)); qu = mq.group(3)
+            if qu.lower() == "lb":
+                q = lb_to_kg(q)
+            sd = calc_scaled_distance(dist, du, q)
+            if sd is None:
+                return "Provide a positive charge per delay."
+            return f"📉 **Scaled Distance** = distance/√charge = **{sd:.2f} m/√kg** (distance={dist} {du}, charge={q:.2f} kg)"
+        else:
+            return "To compute SD, include a distance (m/ft) and charge per delay (kg/lb). Example: `sd 300 m, 35 kg`."
+
+    # ---- Langefors–Kihlström (parametric) -----------------------------------
+    if re.search(r"\blk\b|kihl|langefors", txt, flags=re.I):
+        vals = parse_kv_numbers(txt, ["d","k","alpha","f"])
+        Dmm   = vals.get("d", st.session_state.defaults["D"])
+        k     = vals.get("k", st.session_state.defaults["lk_k"])
+        alpha = vals.get("alpha", st.session_state.defaults["lk_alpha"])
+        F     = vals.get("f", st.session_state.defaults["lk_F"])
+        B, S = lk_burden_spacing(Dmm, k, alpha, F)
+        return (f"📐 **Langefors–Kihlström (parametric)**\n"
+                f"- D={Dmm:.0f} mm, k={k:.2f}, α={alpha:.2f}, F={F:.2f}\n"
+                f"- **Burden B ≈ {B:.2f} m**, **Spacing S ≈ {S:.2f} m**\n"
+                f"_Tune k/α/F to your site calibration; this keeps the method flexible._")
+
+    # ---- Nobel cartridge method ---------------------------------------------
+    if re.search(r"\bnobel\b|cartridge", txt, flags=re.I):
+        vals = parse_kv_numbers(txt, ["h","j","t","L","cart_d","rho","d"])
+        H   = vals.get("h", st.session_state.defaults["H"])
+        J   = vals.get("j", st.session_state.defaults["J"])
+        T   = vals.get("t", st.session_state.defaults["T"])
+        L   = vals.get("L", st.session_state.defaults["cart_len"])
+        cart_d = vals.get("cart_d", st.session_state.defaults["cart_diam"])
+        rho_c = vals.get("rho", st.session_state.defaults["cart_rho"])
+        # charged length from bench
+        charged_len = max(H + J - T, 0.0)
+        n, m_cart, m_total = nobel_cartridge_method(charged_len, L, cart_d, rho_c)
+        return (f"🧯 **Nobel / cartridge-based estimate**\n"
+                f"- Charged length Lc ≈ **{charged_len:.2f} m**; cartridge L={L:.2f} m, Ø={cart_d:.0f} mm, ρ={rho_c:.0f} kg/m³\n"
+                f"- Mass per cartridge ≈ **{m_cart:.2f} kg**\n"
+                f"- Estimated number of cartridges ≈ **{n}**\n"
+                f"- **Total charge ≈ {m_total:.1f} kg**\n"
+                f"_Adjust cartridge size/density to match product datasheet._")
+
+    # ---- Quick burden/spacing rule-of-thumb ---------------------------------
+    if re.search(r"burden|spacing", txt, flags=re.I) and re.search(r"rule|start|estimate", txt, flags=re.I):
+        vals = parse_kv_numbers(txt, ["d"])
+        Dmm = vals.get("d", st.session_state.defaults["D"])
+        B = 30 * mm_to_m(Dmm)
+        S = 1.25 * B
+        T = 25 * mm_to_m(Dmm)
+        return (f"📏 **Starter rules**\n"
+                f"- Burden B ≈ **{B:.2f} m**\n- Spacing S ≈ **{S:.2f} m**\n- Stemming T ≈ **{T:.2f} m**\n"
+                f"(Assumed D={Dmm:.0f} mm; tune for rock/energy/SOP.)")
+
+    # ---- Otherwise: knowledge base answer -----------------------------------
+    return kb_answer(txt)
+
+# Chat input & output
+user_msg = st.chat_input("Type your question or a calc (pf / lk / nobel / sd)…")
+if user_msg:
+    st.session_state.messages.append({"role": "user", "content": user_msg})
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(user_msg)
 
-    answer = reply(prompt)
-
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+    bot = respond(user_msg)
+    st.session_state.messages.append({"role": "assistant", "content": bot})
     with st.chat_message("assistant"):
-        st.markdown(answer)
+        st.markdown(bot)
 
 st.markdown("---")
-st.caption("⚠️ This tool is for learning and preliminary planning. Always comply with applicable laws, standards, and your site's blast management plan under a licensed blaster.")
+st.caption("⚠️ For planning education only. Validate with site trials and comply with code/SOP under a licensed blaster.")
